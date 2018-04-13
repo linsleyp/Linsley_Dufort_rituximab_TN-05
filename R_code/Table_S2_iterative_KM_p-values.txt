@@ -1,0 +1,155 @@
+rm(list = ls())
+library(plyr)
+library(survival)
+library(survival)
+library(reshape2)
+library(ggplot2); library(reshape2)
+library(limma)
+
+
+## working directory assumed to be inside a GitHub folder on Mac Desktop
+setwd("~/Desktop/TN-05_GitHub/data_files/")
+
+## set defaults
+theme_set(theme_bw(26) + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) + theme(legend.key = element_blank()))
+update_geom_defaults("point", aes(size = 3))
+
+###### set variables
+
+q = c("CHD3.mod") # if testing a single module
+visit.time = c(26)
+
+top = c(0.75) # select top quartile
+bot = c(0.75) # select bottom quartile
+
+## load data
+
+## C-peptide
+##auc <- read.delim("AUC_cor_RPM+1_Ritux_V26.txt")
+
+## counts
+counts <- read.delim("tmm_norm_Ritux_counts_outliers_removed_collapsed.txt")
+
+## annotation
+anno <- read.delim("TN Unblinded Specimen List_Linsley 20140924_trimmed.txt")
+anno = na.omit(anno)
+colnames(anno)[10] = c("id")
+anno = anno[c(10, 1,2,12, 13,15,16)]
+
+## subset annotation to visit time to analyze gene expression
+
+anno.sub = subset(anno, anno$Visit == visit.time & !anno$Treatment == "Placebo") # for active only
+#anno.sub = subset(anno, anno$Visit == visit.time) # for all subjects
+anno.sub = anno.sub[,-(5:7)]
+
+## load demographcs
+demo <- read.delim("TN05 Data_Linsley 20141126_trimmed.txt")
+
+## merge anno and demographcs
+anno = merge(anno, demo, by = "id")
+
+## load and reformat C-peptide data
+
+mmtt <- read.delim("TN05 MMTT Data_Linsley 20141020_full_AUC_redo.txt")
+mmtt = mmtt[,-(16:ncol(mmtt))]
+colnames(mmtt)[1] = c("id")
+m = mmtt[,4:ncol(mmtt)]
+m[is.na(m)] = 0
+mmtt.2 = data.frame(mmtt[,1:3], m)
+mmtt.2$Treatment = as.character(mmtt.2$Treatment)
+mmtt.2$Responder. = as.character(mmtt.2$Responder.)
+melt.mmtt = melt(mmtt.2, id=c("id","Treatment", "Responder."))
+melt.mmtt = na.omit(melt.mmtt)
+colnames(melt.mmtt)[5] = c("AUC")
+
+## merge anno and C-peptide data
+anno.auc = merge(anno.sub, melt.mmtt, by = "id")
+
+## subset counts to samples from selected visit time
+counts.sub = subset(counts, select = colnames(counts) %in% anno.auc$libID)
+
+# load curvefit and reformat survival (progression) data
+
+surv.cf <- read.csv("TN05.study_days_to_threshold_percent_AUC_from_models.csv", stringsAsFactors=FALSE)
+surv.cf[,1]= NULL
+colnames(surv.cf) = c("id", "separate", "combined")
+surv.cf$id = gsub("TN05_", "", surv.cf$id)
+surv.cf = data.frame(id = surv.cf$id, survival = surv.cf$combined) # use combined model
+surv.cf$survival = gsub("Inf", 7567, surv.cf$survival)
+surv.cf[is.na(surv.cf)] <- 7567
+surv.cf$survival = as.numeric(surv.cf$survival)
+
+surv.cf$survival = ifelse(surv.cf$survival>365*2, 365*2, surv.cf$survival) # cap maaxixmum survival at 2 years
+surv.cf$status = ifelse(surv.cf$survival >= (365*2), 0, 
+                        ifelse(surv.cf$survival < (365*2), 1, 1e6)) # set status = 0 if C-peptide half life >22 years, else status = 1
+
+# load and select gene modules 
+
+mods.full <- read.delim("Supp_Table_1_Genes\ in\ immune\ molecular\ modules.gmx")
+tcell.mods = c("STAT4.mod", "GATA3.mod", "TIGIT.mod", "CD8B.mod", "GZMK.mod", "CHD3.mod", "CTLA4.mod", "FOXP3.mod", "IL2RA.mod", "RBL2.mod", "TCF7.mod", "CD28.mod", "MAF.mod", "CD8A.mod", "SMAD7.mod", "RORC.mod", "CD5.mod", "IKZF1.mod", "CD2.mod", "CD3E.mod", "GZMM.mod")
+bcell.mods = c("CD19.mod", "SMAD3.mod",  "IRF8.mod",  "NCOA3.mod")
+mod.var = c("tcell.mods")
+mods.used = subset(mods.full, select = colnames(mods.full) %in% get(mod.var))
+
+## set data frame for results from iterative survival tests
+
+DF <- data.frame(module = as.character(), "KM.pval" = as.character(), stringsAsFactors = F)
+DF.full = DF
+
+## set iterative loop
+
+xnames = as.data.frame(unique(colnames(mods.used)))
+ncx = nrow(xnames)
+                        
+for (i in seq_len(ncx)) {                   
+  q = as.character(xnames[i,])
+  qsub = as.data.frame(mods.used[,q])
+  colnames(qsub)[1] = c("symbol")
+  qsub = na.omit(qsub)
+
+## subset counts and anno to module genes
+
+  counts.use = subset(counts.sub, row.names(counts.sub) %in% as.character(qsub$symbol))
+  anno.use = subset(anno, libID %in% colnames(counts.use))
+  lib.order = as.character(anno.use$libID)
+  counts.use = counts.use[lib.order]
+
+# test for identity in colnames(counts.use) and anno.use$libID
+
+  table(ifelse(colnames(counts.use) == anno.use$libID, 1, 0)) # 1 == 28 
+
+## calculate median gene expression in modules, and top and bottom quarti
+
+  anno.use$med = apply(log2(counts.use+1), 2, median)
+
+  qnt.top <- quantile(anno.use$med, probs = top)
+  qnt.bot <- quantile(anno.use$med, probs = bot)
+  top.set = anno.use[anno.use$med > qnt.top,]
+  bot.set = anno.use[anno.use$med <= qnt.bot,]
+
+  var.strat = anno.use
+  var.strat$module.set = ifelse(var.strat$id %in% top.set$id, "module high ", 
+                              ifelse(var.strat$id %in% bot.set$id, "module low ", "other"))
+#      
+
+  var.strat.surv = merge(var.strat, surv.cf, by = "id")
+  var.strat.surv = var.strat.surv[!duplicated(var.strat.surv$id),] # remove duplicated patients
+
+## calculate survival parameters
+
+fit <- survfit(Surv(survival,status)~module.set, data=var.strat.surv)
+sdiff <- survdiff(eval(fit$call$formula), data = eval(fit$call$data))
+pval <- pchisq(sdiff$chisq,length(sdiff$n) - 1,lower.tail = FALSE)
+
+DF[i,] = c(q, pval)
+
+}
+
+DF$KM.pval = as.numeric(DF$KM.pval)
+DF.s = DF[order(DF$KM.pval),]
+p.bh = as.data.frame(p.adjust(DF.s$KM.pval, method = c("BH")))
+DF.s.corr = data.frame(DF.s, p.bh)
+colnames(DF.s.corr) = c("module", "KM.pval", "KM.p.adj_BH")
+
+filename.tab = paste( mod.var, "top", 1-top, "vs", "bottom", bot, "quartiles_KM_plot_treated_subjects_only.txt", sep = "_")
+#write.table(DF.s.corr, filename.tab, sep = "\t", quote = F, row.names = T, col.names = T)

@@ -1,0 +1,269 @@
+rm(list = ls())
+library(plyr)
+library(survival)
+library(survival)
+library(reshape2)
+library(ggplot2); library(reshape2)
+library(limma)
+library(broom)
+library(ggsignif)
+library(gplots)
+
+## set defaults
+theme_set(theme_bw(26) + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) + theme(legend.key = element_blank()))
+update_geom_defaults("point", aes(size = 3))
+
+##load files 
+
+## working directory assumed to be inside a GitHub folder on Mac Desktop
+setwd("~/Desktop/TN-05_GitHub/data_files/")
+
+tcp = read.xls("TN05 TCP_BAA Data_20171213.xlsx", stringsAsFactors = F, sheet = 2)
+colnames(tcp) = gsub("Random_ID", "id", colnames(tcp))
+
+###### set variables
+
+q = c("CHD3.mod") # if testing a single module
+visit.time = c(26)
+
+top = c(0.75) # select top quartile
+bot = c(0.75) # select bottom quartile
+
+## load data
+
+## counts
+counts <- read.delim("tmm_norm_Ritux_counts_outliers_removed_collapsed.txt")
+
+## annotation
+anno <- read.delim("TN Unblinded Specimen List_Linsley 20140924_trimmed.txt")
+anno = na.omit(anno)
+colnames(anno)[10] = c("id")
+anno = anno[c(10, 1,2,12, 13,15,16)]
+
+## subset annotation to visit time to analyze gene expression
+
+anno.sub = subset(anno, anno$Visit == visit.time & !anno$Treatment == "Placebo") # for active only
+#anno.sub = subset(anno, anno$Visit == visit.time) # for all subjects
+anno.sub = anno.sub[,-(5:7)]
+
+## load demographcs
+demo <- read.delim("TN05 Data_Linsley 20141126_trimmed.txt")
+
+## merge anno and demographcs
+anno = merge(anno, demo, by = "id")
+
+## load and reformat C-peptide data
+
+mmtt <- read.delim("TN05 MMTT Data_Linsley 20141020_full_AUC_redo.txt")
+mmtt = mmtt[,-(16:ncol(mmtt))]
+colnames(mmtt)[1] = c("id")
+m = mmtt[,4:ncol(mmtt)]
+m[is.na(m)] = 0
+mmtt.2 = data.frame(mmtt[,1:3], m)
+mmtt.2$Treatment = as.character(mmtt.2$Treatment)
+mmtt.2$Responder. = as.character(mmtt.2$Responder.)
+melt.mmtt = melt(mmtt.2, id=c("id","Treatment", "Responder."))
+melt.mmtt = na.omit(melt.mmtt)
+colnames(melt.mmtt)[5] = c("AUC")
+#melt.mmtt = subset(melt.mmtt, melt.mmtt$variable %in% NV)
+
+## merge anno and C-peptide data
+anno.auc = merge(anno.sub, melt.mmtt, by = "id")
+
+## subset counts to samples from selected visit time
+counts.sub = subset(counts, select = colnames(counts) %in% anno.auc$libID)
+
+# load curvefit and reformat survival (progression) data
+
+surv.cf <- read.csv("TN05.study_days_to_threshold_percent_AUC_from_models.csv", stringsAsFactors=FALSE)
+surv.cf[,1]= NULL
+colnames(surv.cf) = c("id", "separate", "combined")
+surv.cf$id = gsub("TN05_", "", surv.cf$id)
+surv.cf = data.frame(id = surv.cf$id, survival = surv.cf$combined) # use combined model
+surv.cf$survival = gsub("Inf", 7567, surv.cf$survival)
+surv.cf[is.na(surv.cf)] <- 7567
+surv.cf$survival = as.numeric(surv.cf$survival)
+
+surv.cf$survival = ifelse(surv.cf$survival>365*2, 365*2, surv.cf$survival) # cap maaxixmum survival at 2 years
+surv.cf$status = ifelse(surv.cf$survival >= (365*2), 0, 
+                        ifelse(surv.cf$survival < (365*2), 1, 1e6)) # set status = 0 if C-peptide half life >22 years, else status = 1
+
+# load and select gene modules 
+
+mods.full <- read.delim("Supp_Table_1_Genes\ in\ immune\ molecular\ modules.gmx")
+
+mods.used = subset(mods.full, select = colnames(mods.full) %in% q)
+
+## set data frame for results from iterative survival tests
+
+DF <- data.frame(module = as.character(), "KM.pval" = as.character(), stringsAsFactors = F)
+DF.full = DF
+
+## 
+
+xnames = as.data.frame(unique(colnames(mods.used)))
+ncx = nrow(xnames)
+
+  qsub = as.data.frame(mods.used[,q])
+  colnames(qsub)[1] = c("symbol")
+  qsub = na.omit(qsub)
+
+## subset counts and anno to module genes
+
+  counts.use = subset(counts.sub, row.names(counts.sub) %in% as.character(qsub$symbol))
+  anno.use = subset(anno, libID %in% colnames(counts.use))
+  lib.order = as.character(anno.use$libID)
+  counts.use = counts.use[lib.order]
+
+# test for identity in colnames(counts.use) and anno.use$libID
+
+  table(ifelse(colnames(counts.use) == anno.use$libID, 1, 0)) # 1 == 28 
+
+## calculate median gene expression in modules, and top and bottom quarti
+
+  anno.use$med = apply(log2(counts.use+1), 2, median)
+
+  qnt.top <- quantile(anno.use$med, probs = top)
+  qnt.bot <- quantile(anno.use$med, probs = bot)
+  top.set = anno.use[anno.use$med > qnt.top,]
+  bot.set = anno.use[anno.use$med <= qnt.bot,]
+
+  var.strat = anno.use
+  var.strat$module.set = ifelse(var.strat$id %in% top.set$id, "module high ", 
+                              ifelse(var.strat$id %in% bot.set$id, "module low ", "other"))
+#      
+
+  var.strat.surv = merge(var.strat, surv.cf, by = "id")
+  var.strat.surv = var.strat.surv[!duplicated(var.strat.surv$id),] # remove duplicated patients
+
+## calculate survival parameters
+
+fit <- survfit(Surv(survival,status)~module.set, data=var.strat.surv)
+sdiff <- survdiff(eval(fit$call$formula), data = eval(fit$call$data))
+pval <- pchisq(sdiff$chisq,length(sdiff$n) - 1,lower.tail = FALSE)
+
+## add annotation to TCP data
+
+anno.to.use = subset(anno, libID %in% colnames(counts))
+anno.to.use = anno.to.use[,-(2:5)]
+anno.basic = subset(anno.to.use, !duplicated(id))
+anno.tcp = merge(anno.basic, tcp, by = "id")
+anno.tcp$Visit = gsub("Baseline", "Month 0", anno.tcp$Visit)
+
+v = strsplit2(anno.tcp$Visit, " ")
+v = data.frame(v)
+anno.tcp$visit = v[,2]
+
+islet = subset(anno.tcp, Test.Name %in% grep("ISLA", anno.tcp$Test.Name, value = T))
+milk = subset(anno.tcp, Test.Name %in% grep("MIP", anno.tcp$Test.Name, value = T))
+neuronal = subset(anno.tcp, Test.Name %in% grep("CNSA|GLIA", anno.tcp$Test.Name, value = T))
+
+anno.tcp$Ag = ifelse(anno.tcp$Test.Name %in% islet$Test.Name, "islet",
+					ifelse(anno.tcp$Test.Name %in% milk$Test.Name, "milk",
+						ifelse(anno.tcp$Test.Name %in% neuronal$Test.Name, "neuronal","other")))
+
+to.plot = subset(anno.tcp, Test.Name %in% grep("ISLA|CNSA|MIP", anno.tcp$Test.Name, value = T))
+to.plot = subset(anno.tcp, Test.Name %in% grep("ISLA", anno.tcp$Test.Name, value = T))
+to.plot = subset(anno.tcp, ! Ag == "other")
+
+to.plot = subset(to.plot, Treatment == "Active")
+to.plot = subset(to.plot, id %in% anno.to.use$id)
+
+to.plot$quartile = ifelse(to.plot$id %in% top.set$id, "High", 
+						ifelse(to.plot$id %in% bot.set$id, "Low","other"))
+#
+to.plot = subset(to.plot, !quartile == "other")
+
+## split test name variables
+
+to.plot = subset(anno.tcp, Test.Name %in% grep("ISLA|CNSA|MIP", anno.tcp$Test.Name, value = T))
+to.plot = subset(anno.tcp, Test.Name %in% grep("ISLA", anno.tcp$Test.Name, value = T))
+to.plot = subset(anno.tcp, ! Ag == "other")
+
+to.plot = subset(to.plot, Treatment == "Active")
+to.plot = subset(to.plot, id %in% anno.to.use$id)
+
+to.plot$quartile = ifelse(to.plot$id %in% top.set$id, "High", 
+						ifelse(to.plot$id %in% bot.set$id, "Low","other"))
+#
+to.plot = subset(to.plot, !quartile == "other")
+
+to.plot$rep = substr(to.plot$Test.Name, nchar(to.plot$Test.Name)-2, nchar(to.plot$Test.Name))
+to.plot$tn = substr(to.plot$Test.Name, 1, nchar(to.plot$Test.Name)-4)
+
+i = c("GAD55", "TEP69", "PI", "GAD" )
+m = c("BLG", "BSA193", "BSA", "CAESIN", "ABBOS")
+n = c("MBP", "EX2", "S100", "GFAP")
+
+levs = c(i, m, n)
+ags = data.frame(strsplit2(to.plot$tn, "_"))
+to.plot$tn2 = ags[,2]
+
+to.plot$tn2 = factor(to.plot$tn2, levels = levs)
+to.plot = subset(to.plot, rep == "SIB")
+to.plot = subset(to.plot, !visit == "42")
+to.plot = subset(to.plot, !visit == "36")
+
+## tabulate summary stats
+
+to.plot.na = na.omit(to.plot)
+
+tgc <- ddply(to.plot, c("visit", "quartile", "Ag"), summarise,
+               N    = length(quartile),
+               mean = mean(Test.Result),
+			   median = median(Test.Result),
+               sd   = sd(Test.Result),
+               se   = sd / sqrt(N),
+			   mad = mad(Test.Result)
+			   
+)
+tgc = na.omit(tgc)
+colnames(tgc)[2] = c("module")
+tgc$visit = as.character(tgc$visit)
+tgc$visit = as.numeric(tgc$visit)
+tgc$visit = tgc$visit*4
+
+dev.off()
+quartz(width=10,height=10,dpi=72)  ### 
+update_geom_defaults("line", aes(size = 2))
+
+ggplot(tgc, aes(y = mean, x = visit)) + geom_line(aes(colour = module, group = module)) + facet_wrap(~Ag, nrow = 3)
+last_plot() + geom_errorbar(data = tgc, aes(ymin=mean-se, ymax=mean+se, width=0.25, colour = module))
+last_plot() + labs(y = "Stimulation index", x = "Visit (weeks)")
+last_plot() + scale_y_continuous(limits = c(0,3))
+
+## best models
+
+to.model = subset(to.plot, Ag == "islet")
+m = aov(Test.Result~visit*quartile + Error(id/visit), data = to.model); summary(m)
+m = aov(Test.Result~visit*quartile + Error(id), data = to.model); summary(m) # this fits the data best
+
+## calculate numbers of samples
+
+ag = c("islet")
+
+quar = c("High")
+
+temp = subset(to.plot, Ag == ag & quartile == quar)
+temp$visit = as.character(temp$visit)
+temp$visit = as.numeric(temp$visit)
+
+table(temp$visit, temp$tn2)
+
+islet high N = 6, 5, 6, 6, 6, 6, 4
+islet low N = 12, 18, 19, 19, 17, 19, 7 #for each of 4 Ags
+
+
+milk high N = 6, 5, 6, 6, 6, 6, 4
+milk low N = 12, 18, 19, 19, 17, 19, 7 #for each of 5 Ags
+
+neuronal low N = 12, 18, 19, 19, 17, 19, 7 
+neuronal high N = 6, 5, 6, 6, 6, 6, 4 #for each of 4 Ags
+
+
+
+
+
+
+
+

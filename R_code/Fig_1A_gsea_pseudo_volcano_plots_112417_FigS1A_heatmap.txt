@@ -1,0 +1,101 @@
+rm(list = ls())
+
+## working directory assumed to be inside a GitHub folder on Mac Desktop
+setwd("~/Desktop/TN-05_GitHub/data_files/GSEA")
+
+## load packages
+library(MAST)
+library(plyr)
+library(ggplot2); theme_set(theme_bw(24)); library(reshape2)
+library(RColorBrewer)
+library(edgeR)
+
+## set defaults
+theme_set(theme_bw(26) + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) + theme(legend.key = element_blank()))
+update_geom_defaults("point", aes(size = 4))
+
+up.0 <- read.delim("v0_all_treated_vs_all_placebo_1k_perm_up_redo_112317.txt")
+dn.0 <- read.delim("v0_all_treated_vs_all_placebo_1k_perm_dn_redo_112317.txt")
+up.26 <- read.delim("v26_all_treated_vs_all_placebo_1k_perm_up_redo_112317.txt")
+dn.26 <- read.delim("v26_all_treated_vs_all_placebo_1k_perm_dn_redo_112317.txt")
+up.52 <- read.delim("v52_all_treated_vs_all_placebo_1k_perm_up_redo_112317.txt")
+dn.52 <- read.delim("v52_all_treated_vs_all_placebo_1k_perm_dn_redo_112317.txt")
+up.78 <- read.delim("v78_all_treated_vs_all_placebo_1k_perm_up_redo_112317.txt")
+dn.78 <- read.delim("v78_all_treated_vs_all_placebo_1k_perm_dn_redo_112317.txt")
+up.104 <- read.delim("v104_all_treated_vs_all_placebo_1k_perm_up_redo_112317.txt")
+dn.104 <- read.delim("v104_all_treated_vs_all_placebo_1k_perm_dn_redo_112317.txt")
+
+t = c(26)
+var1 = paste("up", t, sep = ".")
+var2 = paste("dn", t, sep = ".")
+
+title = paste("week ", t, sep = "")
+filename = paste("Treated_vs_placebo", t, "weeks.pdf", sep = "_")
+
+both = rbind(get(var1), get(var2))
+var = both
+
+fdr = -log10(0.2) # 0.699
+up.col = c("#ca0020")
+dn.col = c("#0571b0")
+
+dev.off()
+quartz(height =8, width =12, dpi =72);
+
+update_geom_defaults("point", aes(size = 8))
+var$color = ifelse(var$NES > 0 & -log10(var$FDR.q.val) > fdr, up.col, 
+				ifelse(var$NES < 0 & -log10(var$FDR.q.val) > fdr, dn.col, "gray"))
+
+ggplot(var, aes(x = NES, y = -log10(FDR.q.val))) + geom_jitter(color = var$color, alpha = 0.5)
+last_plot() + scale_y_continuous(limits = c(-0.1,2.2))
+last_plot() + scale_x_continuous(limits = c(-2.2,2.2))
+last_plot() + labs(x = "Normalized Enrichment Score", y = "-log10(FDR)")
+last_plot() + geom_hline(yintercept = fdr, linetype = "dashed")
+last_plot() + ggtitle(title) + theme(plot.title = element_text(hjust = 0.5))
+
+setwd("~/Desktop")
+ggsave(filename, plot = last_plot(), width=7, height=5)
+
+## Figure S1A
+
+## use 26 week data from above
+
+t = c(26)
+dir = c("up")
+
+filename = paste("modules_treated_vs_placebo", dir, t, "weeks.txt", sep = "_")
+
+var.s = paste(dir, t, sep = ".")
+var.use = get(var.s)
+
+sig.sub = subset(var.use, var.use$FDR.q.val <0.15)
+sig.mods = as.data.frame(sig.sub$NAME)
+
+## identify sig up modules 060617
+
+temp = subset(var, -log10(FDR.q.val)>0.7 & NES >0) # N = 21
+tempa = subset(var, -log10(FDR.q.val)>0.7 & NES <0) # N = 4
+
+gsea.sig = as.character(temp$NAME)
+gsea.sig = gsub("MOD", "mod", gsea.sig)
+
+## heatmap of overlap
+setwd("~/Desktop/TN-05_GitHub/data_files")
+
+overlap <- read.delim("imune_module_overlap.txt", stringsAsFactors=FALSE)
+
+over.sub = subset(overlap, select = colnames(overlap) %in% gsea.sig)
+row.names(over.sub) = overlap$X
+over.sub = subset(over.sub, row.names(over.sub) %in% gsea.sig)
+
+############### heatmap of overlaps
+to.plot = as.matrix(over.sub)
+quartz(width=12,height=8,dpi=72)  ### heaatmap too big for RStudio
+#rgb.palette= colorRampPalette(c("blue", "white", "red"), space = "rgb")
+rgb.palette= colorRampPalette(c("white", "springgreen2","springgreen4"), space = "rgb")
+library(gplots)
+
+heatmap.2(to.plot, density.info=c("none"), scale = c("none"), trace="none", col =  rgb.palette(20), keysize = 1, cexRow=0.8, cexCol = 0.8, margin=c(10, 20), na.color = "grey", dendrogram = c("both"), breaks = seq(0,1, by = 0.05))
+
+
+

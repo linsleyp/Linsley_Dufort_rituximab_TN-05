@@ -1,0 +1,282 @@
+rm(list = ls())
+library(plyr)
+library(survival)
+library(survival)
+library(reshape2)
+library(ggplot2); library(reshape2)
+library(limma)
+library(broom)
+library(ggsignif)
+library(gplots)
+
+## working directory assumed to be inside a GitHub folder on Mac Desktop
+setwd("~/Desktop/TN-05_GitHub/data_files/")
+
+## set defaults
+theme_set(theme_bw(26) + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) + theme(legend.key = element_blank()))
+update_geom_defaults("point", aes(size = 3))
+
+###### set variables
+
+q = c("CD8A.mod") # if testing a single module
+flow.var = c("CD4CD25_PCT")
+
+visit.time = c(26)
+
+top = c(0.75) # select top quartile
+bot = c(0.75) # select bottom quartile
+
+## load data
+## counts
+counts <- read.delim("tmm_norm_Ritux_counts_outliers_removed_collapsed.txt")
+
+## annotation
+anno <- read.delim("TN Unblinded Specimen List_Linsley 20140924_trimmed.txt")
+anno = na.omit(anno)
+colnames(anno)[10] = c("id")
+anno = anno[c(10, 1,2,12, 13,15,16)]
+
+## subset annotation to visit time to analyze gene expression
+
+anno.sub = subset(anno, anno$Visit == visit.time & !anno$Treatment == "Placebo") # for active only
+#anno.sub = subset(anno, anno$Visit == visit.time) # for all subjects
+anno.sub = anno.sub[,-(5:7)]
+
+## load demographcs
+demo <- read.delim("TN05 Data_Linsley 20141126_trimmed.txt")
+
+## merge anno and demographcs
+anno = merge(anno, demo, by = "id")
+
+## load and reformat C-peptide data
+
+mmtt <- read.delim("TN05 MMTT Data_Linsley 20141020_full_AUC_redo.txt")
+mmtt = mmtt[,-(16:ncol(mmtt))]
+colnames(mmtt)[1] = c("id")
+m = mmtt[,4:ncol(mmtt)]
+m[is.na(m)] = 0
+mmtt.2 = data.frame(mmtt[,1:3], m)
+mmtt.2$Treatment = as.character(mmtt.2$Treatment)
+mmtt.2$Responder. = as.character(mmtt.2$Responder.)
+melt.mmtt = melt(mmtt.2, id=c("id","Treatment", "Responder."))
+melt.mmtt = na.omit(melt.mmtt)
+colnames(melt.mmtt)[5] = c("AUC")
+#melt.mmtt = subset(melt.mmtt, melt.mmtt$variable %in% NV)
+
+## merge anno and C-peptide data
+anno.auc = merge(anno.sub, melt.mmtt, by = "id")
+
+## subset counts to samples from selected visit time
+counts.sub = subset(counts, select = colnames(counts) %in% anno.auc$libID)
+
+# load curvefit and reformat survival (progression) data
+
+surv.cf <- read.csv("TN05.study_days_to_threshold_percent_AUC_from_models.csv", stringsAsFactors=FALSE)
+surv.cf[,1]= NULL
+colnames(surv.cf) = c("id", "separate", "combined")
+surv.cf$id = gsub("TN05_", "", surv.cf$id)
+surv.cf = data.frame(id = surv.cf$id, survival = surv.cf$combined) # use combined model
+surv.cf$survival = gsub("Inf", 7567, surv.cf$survival)
+surv.cf[is.na(surv.cf)] <- 7567
+surv.cf$survival = as.numeric(surv.cf$survival)
+
+surv.cf$survival = ifelse(surv.cf$survival>365*2, 365*2, surv.cf$survival) # cap maaxixmum survival at 2 years
+surv.cf$status = ifelse(surv.cf$survival >= (365*2), 0, 
+                        ifelse(surv.cf$survival < (365*2), 1, 1e6)) # set status = 0 if C-peptide half life >22 years, else status = 1
+
+# load and select gene modules 
+
+mods.full <- read.delim("Supp_Table_1_Genes\ in\ immune\ molecular\ modules.gmx")
+tcell.mods = c("STAT4.mod", "GATA3.mod", "TIGIT.mod", "CD8B.mod", "GZMK.mod", "CHD3.mod", "CTLA4.mod", "FOXP3.mod", "IL2RA.mod", "RBL2.mod", "TCF7.mod", "CD28.mod", "MAF.mod", "CD8A.mod", "SMAD7.mod", "RORC.mod", "CD5.mod", "IKZF1.mod", "CD2.mod", "CD3E.mod", "GZMM.mod")
+bcell.mods = c("CD19.mod", "SMAD3.mod",  "IRF8.mod",  "NCOA3.mod")
+#mod.var = c("tcell.mods")
+mod.var = union(tcell.mods, bcell.mods)
+mods.used = subset(mods.full, select = colnames(mods.full) %in% get(mod.var))
+
+## load flow
+flow <- read.delim("TN05 Flow Data_Linsley_20150112_trimmed.txt")
+flow = flow[,-(14:23)]
+colnames(flow)[4] = c("id")
+
+## set up loops
+
+xnames = c("CHD3.mod", "CD2.mod", "GZMK.mod", "CD19.mod")
+#xnames = mod.var
+ncx = length(xnames)
+
+ynames = c("CD3_PCT", "CD4_PCT", "CD8_PCT", "CD19_PCT")
+#ynames = as.character(grep("PCT", flow$Result.name, value = T))
+ncy = length(ynames)
+
+DF = data.frame(mod = as.character(), flow.name = as.character(), cor = as.numeric(), p.val = as.numeric(), stringsAsFactors = F)
+DF2 = DF
+
+for(i in seq_len(ncx)) {
+	q = xnames[i]
+	qsub = as.data.frame(mods.full[,q])
+	colnames(qsub)[1] = c("symbol")
+	
+	counts.use = subset(counts.sub, row.names(counts.sub) %in% as.character(qsub$symbol))
+	 anno.use = subset(anno, libID %in% colnames(counts.use))
+	 lib.order = as.character(anno.use$libID)
+	 counts.use = counts.use[lib.order]
+
+	# test for identity in colnames(counts.use) and anno.use$libID
+
+	  table(ifelse(colnames(counts.use) == anno.use$libID, 1, 0)) # 1 == 28 
+
+	## calculate median gene expression in modules, and top and bottom quarti
+
+	  anno.use$med = apply(log2(counts.use+1), 2, median)
+
+	  qnt.top <- quantile(anno.use$med, probs = top)
+	  qnt.bot <- quantile(anno.use$med, probs = bot)
+	  top.set = anno.use[anno.use$med > qnt.top,]
+	  bot.set = anno.use[anno.use$med <= qnt.bot,]
+
+	  var.strat = anno.use
+	  var.strat$module.set = ifelse(var.strat$id %in% top.set$id, "module high ", 
+	                              ifelse(var.strat$id %in% bot.set$id, "module low ", "other"))
+	#      
+	
+		for(j in seq_len(ncy)) {
+			r = ynames[j]
+			rsub = subset(flow, flow$Result_name == r & flow$Result_type == "RPTD" & flow$VisitNo %in% c( 26))
+			rsub = rsub[c("id", "Result_name", "Result")]
+			
+			var.strat.flow = merge(var.strat, rsub, by = "id")
+			vsf = var.strat.flow
+			
+			vsf$Result = as.character(vsf$Result)
+			vsf$Result = as.numeric(vsf$Result)
+			
+			
+			c = cor(vsf$Result, vsf$med)
+			m = lm(Result~med, vsf); summary(m) #
+			p = glance(m)$p.value # get p value
+			result = as.character(c(q, r, c, p))
+			result = t(data.frame(result, stringsAsFactors = F))
+colnames(result) = c("mod", "flow.name", "cor", "p.val")			
+			DF = rbind(result, DF, stringsAsFactors = F)
+			colnames(DF) = c("mod", "flow.name", "cor", "p.val")
+			
+			}
+		}	
+DF$cor = as.character(DF$cor)		
+DF$cor = as.numeric(DF$cor)		
+
+DF$p.val = as.character(DF$p.val)		
+DF$p.val = as.numeric(DF$p.val)	
+
+df1 = DF[, 1:3]
+temp = dcast(df1, flow.name~mod)
+
+row.names(temp) = temp$flow.name
+temp$flow.name = NULL
+temp$CD19.mod = as.numeric(temp$CD19.mod)
+temp$CD2.mod = as.numeric(temp$CD2.mod)
+temp$CHD3.mod = as.numeric(temp$CHD3.mod)
+temp$GZMK.mod = as.numeric(temp$GZMK.mod)
+
+m = as.matrix(t(temp))
+
+dev.off()
+quartz(width=10,height=10,dpi=72)  ### 
+setwd("~/Desktop")
+#tiff("Plot3.tiff", width = 8, height = 8, units = 'in', res = 75)
+
+cols= 10
+breaks = cols+1
+
+rgb.palette= colorRampPalette(c("blue", "white", "red"), space = "rgb")
+hh = heatmap.2(m, density.info=c("none"), scale = c("none"), trace="none", col =  rgb.palette(rev(cols)), keysize = 1, cexRow=2, cexCol = 2, margin=c(20,10), na.color = "grey", dendrogram = c("both"), Rowv = T, Colv = T)
+
+# Fig S3. scatter plots with p-values and corr coeff
+
+xnames = c("CHD3.mod", "CD2.mod", "GZMK.mod", "CD19.mod")
+ncx = length(xnames)
+
+ynames = c("CD3_PCT", "CD4_PCT", "CD8_PCT", "CD19_PCT")
+ncy = length(ynames)
+
+DF = data.frame(mod = as.character(), flow.name = as.character(), med = as.numeric(), Result = as.numeric(), corr = as.numeric(),  p.value = as.numeric(), stringsAsFactors = F)
+
+for(i in seq_len(ncx)) {
+	q = xnames[i]
+	qsub = as.data.frame(mods.full[,q])
+	colnames(qsub)[1] = c("symbol")
+	
+	counts.use = subset(counts.sub, row.names(counts.sub) %in% as.character(qsub$symbol))
+	 anno.use = subset(anno, libID %in% colnames(counts.use))
+	 lib.order = as.character(anno.use$libID)
+	 counts.use = counts.use[lib.order]
+
+	# test for identity in colnames(counts.use) and anno.use$libID
+
+	  table(ifelse(colnames(counts.use) == anno.use$libID, 1, 0)) # 1 == 28 
+
+	## calculate median gene expression in modules, and top and bottom quarti
+
+	  anno.use$med = apply(log2(counts.use+1), 2, median)
+
+	  qnt.top <- quantile(anno.use$med, probs = top)
+	  qnt.bot <- quantile(anno.use$med, probs = bot)
+	  top.set = anno.use[anno.use$med > qnt.top,]
+	  bot.set = anno.use[anno.use$med <= qnt.bot,]
+
+	  var.strat = anno.use
+	  var.strat$module.set = ifelse(var.strat$id %in% top.set$id, "module high ", 
+	                              ifelse(var.strat$id %in% bot.set$id, "module low ", "other"))
+	#      
+	
+		for(j in seq_len(ncy)) {
+			r = ynames[j]
+			rsub = subset(flow, flow$Result_name == r & flow$Result_type == "RPTD" & flow$VisitNo %in% c( 26))
+			rsub = rsub[c("id", "Result_name", "Result")]
+			
+			var.strat.flow = merge(var.strat, rsub, by = "id")
+			vsf = var.strat.flow
+			
+			vsf$Result = as.character(vsf$Result)
+			vsf$Result = as.numeric(vsf$Result)
+			
+			
+			c = cor(vsf$Result, vsf$med)
+			m = lm(Result~med, vsf); summary(m) #
+			p = glance(m)$p.value # get p value
+			
+			zmed = (vsf$med-mean(vsf$med))/sd(vsf$med)
+			zResult = (vsf$Result-mean(vsf$Result))/sd(vsf$Result)
+			
+			
+			result = data.frame(mod = q, flow.name = r, med = zmed, Result = zResult, corr = c, p.value = p, stringsAsFactors = F)
+		
+colnames(result) = c("mod", "flow.name", "med", "Result", "corr", "p.value")			
+			DF = rbind(result, DF, stringsAsFactors = F)
+			colnames(DF) = c("mod", "flow.name", "med", "Result", "corr", "p.value")
+			
+			}
+		}	
+
+#DF.scat = DF[c("mod","flow.name", "med", "Result" )]
+
+DF$p.value = as.numeric(DF$p.value )
+DF$p.value = format(DF$p.value, digits = 2, scientific = T)
+
+DF$corr = as.numeric(DF$corr )
+DF$corr = format(DF$corr, digits = 2, scientific = F)
+
+DF$mod = factor(DF$mod, levels = c("CD19.mod", "CD2.mod", "CHD3.mod","GZMK.mod"))
+DF$flow.name = factor(DF$flow.name, levels = c("CD19_PCT", "CD3_PCT", "CD4_PCT","CD8_PCT"))
+
+DF = DF[order(DF$flow.name, DF$mod),]
+
+dev.off()
+quartz(width=10,height=10,dpi=72)  ### heaatmap too big for RStudio
+ggplot(DF,aes(x = med, y = Result)) + geom_point() + facet_grid(flow.name~mod)
+last_plot() + geom_smooth(method="lm")
+
+last_plot() + geom_text(data = DF, aes(label=paste("r = ", DF$corr, sep=" ")), x=-2, y=3.5, size = 4)
+last_plot() + geom_text(data = DF, aes(label=paste("p = ", DF$p.value, sep=" ")), x=-2, y=2.9, size = 4)
+last_plot() + labs(x = "Median gene expression, normalized", y = "% marker positive cells, normalized")
+

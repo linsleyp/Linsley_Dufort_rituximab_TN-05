@@ -1,0 +1,237 @@
+rm(list = ls())
+library(plyr)
+library(survival)
+library(survival)
+library(reshape2)
+library(ggplot2); library(reshape2)
+library(limma)
+library(broom)
+library(ggsignif)
+library(gplots)
+library(gdata)
+library(lmerTest)
+
+## working directory assumed to be inside a GitHub folder on Mac Desktop
+setwd("~/Desktop/TN-05_GitHub/data_files/")
+
+## set defaults
+theme_set(theme_bw(26) + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) + theme(legend.key = element_blank()))
+update_geom_defaults("point", aes(size = 3))
+
+##load files 
+
+## phiX174 data
+
+phi = read.xls("TN05 PhiX Data_20171215.xlsx", sheet = 2, stringsAsFactors = F)
+colnames(phi) = gsub("Random.ID", "id", colnames(phi))
+mphi = melt(phi, ids = phi, (1:3))
+mphi$imm = ifelse(mphi$variable %in% grep("Pri", mphi$variable, value = T), 1,
+				ifelse(mphi$variable %in% grep("Sec", mphi$variable, value = T),2,
+					ifelse(mphi$variable %in% grep("Ter", mphi$variable, value = T),3,
+						ifelse(mphi$variable %in% grep("Qua", mphi$variable, value = T),4,1e6))))
+#
+mphi$imm = ifelse(mphi$variable %in% grep("Pri", mphi$variable, value = T), 1,
+				ifelse(mphi$variable %in% grep("Sec", mphi$variable, value = T),2,
+					ifelse(mphi$variable %in% grep("Ter", mphi$variable, value = T),3,
+						ifelse(mphi$variable %in% grep("Qua", mphi$variable, value = T),4,1e6))))
+
+phi.igg = subset(mphi, variable %in% grep("IGG", mphi$variable, value = T))
+mphi = subset(mphi, !variable %in% grep("IGG", mphi$variable, value = T))
+mphi = subset(mphi, !variable %in% grep("^l", mphi$variable, value = T))
+
+mphi$week = ifelse(mphi$variable %in% grep("pre", mphi$variable, value = T), 0, 
+				ifelse(mphi$variable %in% grep("1", mphi$variable, value = T), 1,
+					ifelse(mphi$variable %in% grep("2", mphi$variable, value = T), 2,
+						ifelse(mphi$variable %in% grep("4", mphi$variable, value = T), 4,"other"))))
+# 
+mphi$week = as.numeric(mphi$week)
+mphi$day = (mphi$week)*7
+
+###### set variables
+
+q = c("CHD3.mod") # if testing a single module
+visit.time = c(26)
+
+top = c(0.75) # select top quartile
+bot = c(0.75) # select bottom quartile
+
+## load data
+
+## C-peptide
+##auc <- read.delim("AUC_cor_RPM+1_Ritux_V26.txt")
+
+## counts
+counts <- read.delim("tmm_norm_Ritux_counts_outliers_removed_collapsed.txt")
+
+## annotation
+anno <- read.delim("TN Unblinded Specimen List_Linsley 20140924_trimmed.txt")
+anno = na.omit(anno)
+colnames(anno)[10] = c("id")
+anno = anno[c(10, 1,2,12, 13,15,16)]
+
+## subset annotation to visit time to analyze gene expression
+
+anno.sub = subset(anno, anno$Visit == visit.time & !anno$Treatment == "Placebo") # for active only
+#anno.sub = subset(anno, anno$Visit == visit.time) # for all subjects
+anno.sub = anno.sub[,-(5:7)]
+
+## load demographcs
+demo <- read.delim("TN05 Data_Linsley 20141126_trimmed.txt")
+
+## merge anno and demographcs
+anno = merge(anno, demo, by = "id")
+
+## load and reformat C-peptide data
+
+mmtt <- read.delim("TN05 MMTT Data_Linsley 20141020_full_AUC_redo.txt")
+mmtt = mmtt[,-(16:ncol(mmtt))]
+colnames(mmtt)[1] = c("id")
+m = mmtt[,4:ncol(mmtt)]
+m[is.na(m)] = 0
+mmtt.2 = data.frame(mmtt[,1:3], m)
+mmtt.2$Treatment = as.character(mmtt.2$Treatment)
+mmtt.2$Responder. = as.character(mmtt.2$Responder.)
+melt.mmtt = melt(mmtt.2, id=c("id","Treatment", "Responder."))
+melt.mmtt = na.omit(melt.mmtt)
+colnames(melt.mmtt)[5] = c("AUC")
+#melt.mmtt = subset(melt.mmtt, melt.mmtt$variable %in% NV)
+
+## merge anno and C-peptide data
+anno.auc = merge(anno.sub, melt.mmtt, by = "id")
+
+## subset counts to samples from selected visit time
+counts.sub = subset(counts, select = colnames(counts) %in% anno.auc$libID)
+
+# load curvefit and reformat survival (progression) data
+
+surv.cf <- read.csv("TN05.study_days_to_threshold_percent_AUC_from_models.csv", stringsAsFactors=FALSE)
+surv.cf[,1]= NULL
+colnames(surv.cf) = c("id", "separate", "combined")
+surv.cf$id = gsub("TN05_", "", surv.cf$id)
+surv.cf = data.frame(id = surv.cf$id, survival = surv.cf$combined) # use combined model
+surv.cf$survival = gsub("Inf", 7567, surv.cf$survival)
+surv.cf[is.na(surv.cf)] <- 7567
+surv.cf$survival = as.numeric(surv.cf$survival)
+
+surv.cf$survival = ifelse(surv.cf$survival>365*2, 365*2, surv.cf$survival) # cap maaxixmum survival at 2 years
+surv.cf$status = ifelse(surv.cf$survival >= (365*2), 0, 
+                        ifelse(surv.cf$survival < (365*2), 1, 1e6)) # set status = 0 if C-peptide half life >22 years, else status = 1
+
+# load and select gene modules 
+
+mods.full <- read.delim("Supp_Table_1_Genes\ in\ immune\ molecular\ modules.gmx")
+
+mods.used = subset(mods.full, select = colnames(mods.full) %in% q)
+
+## set data frame for results from iterative survival tests
+
+DF <- data.frame(module = as.character(), "KM.pval" = as.character(), stringsAsFactors = F)
+DF.full = DF
+
+## set iterative loop
+
+xnames = as.data.frame(unique(colnames(mods.used)))
+ncx = nrow(xnames)
+
+  qsub = as.data.frame(mods.used[,q])
+  colnames(qsub)[1] = c("symbol")
+  qsub = na.omit(qsub)
+
+## subset counts and anno to module genes
+
+  counts.use = subset(counts.sub, row.names(counts.sub) %in% as.character(qsub$symbol))
+  anno.use = subset(anno, libID %in% colnames(counts.use))
+  lib.order = as.character(anno.use$libID)
+  counts.use = counts.use[lib.order]
+
+# test for identity in colnames(counts.use) and anno.use$libID
+
+  table(ifelse(colnames(counts.use) == anno.use$libID, 1, 0)) # 1 == 28 
+
+## calculate median gene expression in modules, and top and bottom quarti
+
+  anno.use$med = apply(log2(counts.use+1), 2, median)
+
+  qnt.top <- quantile(anno.use$med, probs = top)
+  qnt.bot <- quantile(anno.use$med, probs = bot)
+  top.set = anno.use[anno.use$med > qnt.top,]
+  bot.set = anno.use[anno.use$med <= qnt.bot,]
+
+  var.strat = anno.use
+  var.strat$module.set = ifelse(var.strat$id %in% top.set$id, "module high ", 
+                              ifelse(var.strat$id %in% bot.set$id, "module low ", "other"))
+#      
+
+  var.strat.surv = merge(var.strat, surv.cf, by = "id")
+  var.strat.surv = var.strat.surv[!duplicated(var.strat.surv$id),] # remove duplicated patients
+
+## calculate survival parameters
+
+fit <- survfit(Surv(survival,status)~module.set, data=var.strat.surv)
+sdiff <- survdiff(eval(fit$call$formula), data = eval(fit$call$data))
+pval <- pchisq(sdiff$chisq,length(sdiff$n) - 1,lower.tail = FALSE)
+
+## merge values with anno
+
+anno.to.use = subset(anno, libID %in% colnames(counts))
+anno.u = subset(anno.to.use, !duplicated(anno.to.use$id)) # 54
+anno.u = subset(anno.u, id %in% mphi$id) # 26
+
+anno.phi = merge(anno.u, mphi, by = "id")
+
+#
+
+anno.phi$value = as.numeric(anno.phi$value)
+anno.phi$module = ifelse(anno.phi$id %in% top.set$id, "High", 
+						ifelse(anno.phi$id %in% bot.set$id, "Low","other"))
+#
+to.plot = subset(anno.phi, !module == "other")
+
+to.plot = na.omit(to.plot)
+
+#
+to.plot = subset(anno.igg, !module == "other")
+to.plot = subset(anno.phi, !module == "other")
+
+#to.plot = subset(to.plot, !variable %in% grep("Un", to.plot$variable, value = T))
+to.plot = subset(to.plot, !variable %in% grep("Tr", to.plot$variable, value = T))
+
+to.plot = subset(anno.phi, !module == "other")
+to.plot = subset(to.plot, !variable %in% grep("Tr", to.plot$variable, value = T))
+to.plot = subset(to.plot, !variable %in% grep("Un", to.plot$variable, value = T))
+
+to.plot = na.omit(to.plot)
+to.plot = na.omit(to.plot)
+to.plot$log = log(to.plot$value+0.001)
+to.plot$imm = gsub(1, "primary", to.plot$imm)
+to.plot$imm = gsub(2, "secondary", to.plot$imm)
+to.plot$imm = gsub(3, "tertiary", to.plot$imm)
+to.plot$imm = gsub(4, "quarternary", to.plot$imm)
+to.plot$imm = factor(to.plot$imm, levels = c("primary", "secondary", "tertiary", "quarternary"))
+
+
+tgc <- ddply(to.plot, c("day", "module", "imm", "day"), summarise,
+               N    = length(module),
+               mean = mean(log),
+			   median = median(log),
+               sd   = sd(log),
+               se   = sd / sqrt(N),
+			   mad = mad(log)
+			   
+)
+
+## make plot
+dev.off()
+quartz(width=10,height=10,dpi=72)  ### 
+update_geom_defaults("line", aes(size = 1))
+ggplot(to.plot, aes(x = day, y = log)) + geom_line(aes(colour = module, group = id), alpha = 0.5, size = 0.5) + facet_wrap(~imm, scales = "free")
+last_plot() + geom_line(data = tgc, aes(x = day, y = median, colour = module, group = module), size = 2)
+#last_plot() + geom_errorbar(data = tgc, aes(ymin=median-mad, ymax=median+mad, width=2, colour = module))
+last_plot() + labs(x = "Time post immunization (days)", y = "log(Kv)")
+
+## best models
+
+to.model = subset(to.plot, imm == "secondary")
+m = aov(log~day*module + Error(id/day), data = to.model); summary(m)
+m = aov(log~day*module + Error(id), data = to.model); summary(m) # this fits the data best
+

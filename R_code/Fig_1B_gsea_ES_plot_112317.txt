@@ -1,0 +1,74 @@
+### from here
+rm(list = ls())
+
+## working directory assumed to be inside a GitHub folder on Mac Desktop
+setwd("~/Desktop/TN-05_GitHub/data_files/GSEA")
+
+## load packages
+library(MAST)
+library(plyr)
+library(ggplot2); theme_set(theme_bw(24)); library(reshape2)
+library(RColorBrewer)
+library(edgeR)
+library(gdata)
+
+## set defaults
+theme_set(theme_bw(26) + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) + theme(legend.key = element_blank()))
+update_geom_defaults("point", aes(size = 4))
+
+### read from Excel files
+
+CD19.mod <- read.delim("CD19.MOD.xls", stringsAsFactors = F)
+
+CD2.mod <-  read.delim("CD2.MOD.xls", stringsAsFactors = F)
+
+CHD3.mod =  read.delim("CHD3.MOD.xls", stringsAsFactors = F)
+
+GZMK.mod = read.delim("GZMK.MOD.xls", stringsAsFactors = F)
+
+######## run here
+ngenes = c(14818)
+
+var = c("CD2.mod")
+visit = c("26")
+
+title = paste(var, ", visit ", visit, sep = "")
+filename = paste(var, "visit", visit, "pdf", sep = ".")
+
+rt = get(var)
+rt.s = rt[c(6,8)]
+first.row = data.frame(RANK.IN.GENE.LIST = 0, RUNNING.ES = 0)
+last.row = data.frame(RANK.IN.GENE.LIST = ngenes, RUNNING.ES = 0)
+rt.t = rbind(first.row, rt.s, last.row)
+
+title = paste(var, ", ", "week ", visit, sep = "")
+filename = paste(var, ", ", "week ", visit, ".pdf", sep = "")
+
+update_geom_defaults("line", aes(size = 2))
+
+dev.off()
+quartz(height =8, width =12, dpi =72);
+
+up.col = c("#ca0020") # for T cell modules
+dn.col = c("#0571b0") # for CD19
+
+update_geom_defaults("line", aes(size = 4))
+ggplot(rt.t, aes(x = RANK.IN.GENE.LIST, y = RUNNING.ES)) + geom_line(colour = up.col)
+last_plot() + scale_y_continuous(limits = c(-1,1))
+last_plot() + geom_hline(yintercept = 0)
+last_plot() + geom_vline(xintercept = ngenes/2, linetype="dashed")
+update_geom_defaults("rug", aes(size = 1))
+last_plot() + geom_rug(sides = "b")
+last_plot() + labs(x = "Gene rank (treated versus placebo)", y = "Enrichment score (ES)")
+
+last_plot() + ggtitle(title) + theme(plot.title = element_text(hjust = 0.5))
+
+setwd("~/Desktop")
+ggsave(filename, plot = last_plot(), width=7, height=5)
+
+
+#X = ngenes-2000 
+#Y = 1
+#last_plot() + annotate("text", X, Y, label = var)
+
+#### end here
